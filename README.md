@@ -1,169 +1,104 @@
-# 🌾 AgriShield Flask ML API - Deployment Guide
+# AgriShield ML Flask API
 
-## 📋 **What This Is:**
+## 🎯 Simple Setup
 
-A complete Flask ML API system with 3 ML components:
-1. **Pest Detection** - YOLO object detection
-2. **Pest Forecasting** - 7-day risk prediction
-3. **Admin Training** - Model training system
-
----
-
-## ✅ **Pre-Deployment Checklist:**
-
-### **Required Files (All Present):**
-- ✅ `app.py` - Main Flask application
-- ✅ `admin_training_script.py` - Training script
-- ✅ `config.py` - Configuration (reads from parent config.php)
-- ✅ `requirements.txt` - Python dependencies
-- ✅ `run_auto.sh` - Auto-start script
-- ✅ `start_flask.sh` - Startup script
-- ✅ `start_flask.bat` - Windows startup script
-- ✅ `env_template.txt` - Environment variables template
-
-### **Configuration:**
-- ✅ Reads database credentials from `../config.php` automatically
-- ✅ No hardcoded values
-- ✅ All configurable via environment variables
-
----
-
-## 🚀 **Quick Deployment Steps:**
-
-### **1. Upload Files:**
-Upload entire `AgriShield_ML_Flask` folder to server.
-
-### **2. Set Permissions:**
+### Local Development (Your Computer):
 ```bash
-cd AgriShield_ML_Flask
-chmod +x run_auto.sh
-chmod +x start_flask.sh
-chmod +x app.py
-chmod +x admin_training_script.py
+python app.py
 ```
+✅ Runs on port 5001  
+✅ Flask development server  
+✅ Good for testing
 
-### **3. Install Dependencies:**
+### Production Webserver:
 ```bash
-cd AgriShield_ML_Flask
-pip3 install -r requirements.txt
+gunicorn -c gunicorn_config.py wsgi:application
 ```
-
-### **4. Place ML Model:**
-Place `best.pt` model file in one of these locations:
-- `AgriShield_ML_Flask/ml_models/pest_detection/best.pt` (preferred)
-- `AgriShield_ML_Flask/models/best.pt`
-- `AgriShield_ML_Flask/best.pt`
-
-### **5. Start Flask:**
-```bash
-./run_auto.sh start
-```
-
-### **6. Auto-Start on Boot (Optional):**
-```bash
-crontab -e
-# Add: @reboot cd /path/to/Proto1/AgriShield_ML_Flask && ./run_auto.sh start
-```
+✅ Production-ready  
+✅ Handles multiple requests  
+✅ Auto-restarts on crash
 
 ---
 
-## 🔧 **Configuration:**
+## 📁 Files
 
-### **Database:**
-- Automatically reads from `../config.php` (parent directory)
-- No manual configuration needed
-- Credentials: Already configured in config.php
-
-### **Port:**
-- Default: `8000`
-- Changeable via environment variable: `FLASK_PORT=8000`
-
-### **Host:**
-- Default: `0.0.0.0` (all interfaces)
-- Changeable via environment variable: `FLASK_HOST=0.0.0.0`
+- **`app.py`** - Main Flask application (pest detection + forecasting)
+- **`wsgi.py`** - WSGI entry point for Gunicorn
+- **`gunicorn_config.py`** - Gunicorn production configuration
+- **`requirements.txt`** - Python dependencies
 
 ---
 
-## 📡 **API Endpoints:**
+## 🔧 Configuration
 
-### **Pest Detection:**
-- `POST /detect/` - Detect pests in image
-- `POST /classify/` - Mobile app compatibility
+### Port
+- Default: **5001**
+- Matches PHP backend calls: `http://localhost:5001/detect`
 
-### **Pest Forecasting:**
-- `GET /forecast/` - 7-day pest forecast
-- `GET /forecast/quick/` - Quick forecast
-- `GET /forecast/current/` - Current forecast
-- `GET /forecast/update/` - Manual weather update
+### Model Path
+1. Checks database via PHP endpoint
+2. Falls back to `datasets/best 2.pt`
+3. Falls back to `pest_detection_ml/models/best.pt`
 
-### **Health Check:**
-- `GET /health/` - Health check
-- `GET /status/` - Status check
-
----
-
-## 🧪 **Test After Deployment:**
-
-```bash
-# Test health endpoint
-curl http://localhost:8000/health/
-
-# Test detection (if you have an image)
-curl -X POST -F "image=@test.jpg" http://localhost:8000/detect/
-
-# Check if running
-ps aux | grep app.py
-```
+### Classes
+- **Dynamically loaded** from model
+- No hardcoding - reads from `model.names`
 
 ---
 
-## 📝 **Important Notes:**
+## 📡 Endpoints
 
-1. **Model File:** Make sure `best.pt` is included or placed in correct location
-2. **Database:** Ensure `config.php` exists in parent directory with correct credentials
-3. **Port:** Make sure port 8000 is not blocked by firewall
-4. **Python:** Requires Python 3.8+
-5. **Dependencies:** All listed in `requirements.txt`
+### Detection:
+- `GET /health` - Health check
+- `GET /status` - Status check  
+- `POST /detect` - Detect pests (multipart form-data)
+- `POST /classify` - Classify pests (Android app)
 
----
-
-## 🔍 **Troubleshooting:**
-
-### **Flask won't start:**
-- Check Python version: `python3 --version`
-- Check dependencies: `pip3 list`
-- Check logs: `tail -f flask_auto.log`
-
-### **Model not found:**
-- Place `best.pt` in `ml_models/pest_detection/` folder
-- Check model path in logs
-
-### **Database connection failed:**
-- Verify `config.php` exists in parent directory
-- Check database credentials in `config.php`
-- Test connection: `python3 -c "from config import DB_CONFIG; print(DB_CONFIG)"`
+### Forecasting:
+- `GET /forecast` - Generate 7-day pest forecast
+- `POST /forecast` - Generate forecast with custom days
+- `GET /forecast/quick` - Quick single forecast
+- `GET /forecast/current` - Get forecast from database
+- `POST /forecast/update` - Manually update forecast
 
 ---
 
-## 📊 **System Requirements:**
+## ✅ Features
 
-- Python 3.8+
-- MySQL/MariaDB database
-- ~2GB RAM (for YOLO model)
-- Port 8000 available
-- Internet connection (for weather API)
-
----
-
-## ✅ **Ready for Deployment!**
-
-All files are present and configured. Just upload, install dependencies, and start!
+- ✅ Dynamic class loading from model
+- ✅ Database model path lookup
+- ✅ Fallback to "best 2.pt"
+- ✅ Pest detection with YOLO
+- ✅ Pest forecasting
+- ✅ Production-ready with Gunicorn
+- ✅ Auto-restart on crash
 
 ---
 
-## 📞 **Support:**
+## 🚀 Quick Start
 
-See `SERVER_SETUP.md` for detailed setup instructions.
-See `AUTO_START_GUIDE.md` for auto-start options.
-See `ML_SYSTEMS_ANALYSIS.md` for system overview.
+1. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. **Run locally:**
+   ```bash
+   python app.py
+   ```
+
+3. **Test:**
+   ```bash
+   curl http://localhost:5001/health
+   ```
+
+---
+
+## 📝 Notes
+
+- Flask framework is used for all endpoints
+- Local = Flask dev server (`app.run()`)
+- Production = Gunicorn (WSGI server)
+- Both use the same Flask code!
+
 

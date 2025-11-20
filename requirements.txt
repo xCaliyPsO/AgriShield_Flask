@@ -27,4 +27,7 @@ requests>=2.31.0
 # Optional but recommended (production server)
 gunicorn>=21.2.0
 
+# HTTP Requests (for PHP endpoint calls)
+requests>=2.31.0
+
 

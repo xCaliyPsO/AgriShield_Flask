@@ -103,14 +103,39 @@ def load_config_from_php():
 php_config = load_config_from_php()
 
 # Database configuration
-# Priority: Environment variables > config.php > defaults
+# Priority: Environment variables > local defaults > config.php
+# Use local database by default for training (online DB may not be accessible)
 DB_CONFIG = {
-    'host': os.getenv('DB_HOST', php_config.get('db_host', 'localhost')),
-    'user': os.getenv('DB_USER', php_config.get('db_user', 'root')),
-    'password': os.getenv('DB_PASSWORD', php_config.get('db_password', '')),
-    'database': os.getenv('DB_NAME', php_config.get('db_name', 'asdb')),
+    'host': os.getenv('DB_HOST', 'localhost'),
+    'user': os.getenv('DB_USER', 'root'),  # Default to local root user
+    'password': os.getenv('DB_PASSWORD', ''),  # Default to empty (local XAMPP)
+    'database': os.getenv('DB_NAME', 'asdb'),  # Default to local database
     'charset': os.getenv('DB_CHARSET', 'utf8mb4')
 }
+
+# Only use config.php if environment variables are not set
+if not os.getenv('DB_HOST') and not os.getenv('DB_USER'):
+    # Check if we can connect to local database first
+    try:
+        test_conn = pymysql.connect(
+            host='localhost',
+            user='root',
+            password='',
+            database='asdb'
+        )
+        test_conn.close()
+        print("[OK] Using local database (localhost/root/asdb)", flush=True)
+    except Exception:
+        # If local fails, try config.php credentials
+        print("[WARNING] Local database not accessible, trying config.php credentials...", flush=True)
+        DB_CONFIG = {
+            'host': php_config.get('db_host', 'localhost'),
+            'user': php_config.get('db_user', 'root'),
+            'password': php_config.get('db_password', ''),
+            'database': php_config.get('db_name', 'asdb'),
+            'charset': 'utf8mb4'
+        }
+        print(f"[INFO] Using database from config.php: {DB_CONFIG['host']} / {DB_CONFIG['database']}", flush=True)
 
 print(f"[OK] Database config: {DB_CONFIG['host']} / {DB_CONFIG['database']}", flush=True)
 
@@ -123,20 +148,38 @@ class AdminTrainingLogger:
         self.setup_logger()
     
     def setup_logger(self):
-        """Setup logging configuration - XAMPP compatible"""
+        """Setup logging configuration - XAMPP compatible with Windows permission handling"""
+        import sys
+        import os
+        
         # Logs go to parent directory (Proto1/training_logs/)
         script_dir = Path(__file__).resolve().parent.parent
         log_dir = script_dir / "training_logs"
-        log_dir.mkdir(exist_ok=True)
-        # XAMPP: Ensure directory is writable
+        
+        # Create directory with proper error handling
         try:
-            import os
-            os.chmod(str(log_dir), 0o777)
-        except:
-            pass
+            log_dir.mkdir(exist_ok=True)
+        except PermissionError:
+            # Use ASCII-safe message for Windows
+            print(f"[WARNING] Cannot create training_logs directory. Using fallback location.", flush=True)
+            # Fallback to temp directory or current directory
+            log_dir = Path.cwd() / "training_logs"
+            try:
+                log_dir.mkdir(exist_ok=True)
+            except Exception as e:
+                # Use ASCII-safe message for Windows
+                print(f"[WARNING] Cannot create fallback log directory: {e}", flush=True)
+                # Last resort: use current directory
+                log_dir = Path.cwd()
+        
+        # Windows: Try to set permissions (may not work on Windows)
+        try:
+            if os.name != 'nt':  # Not Windows
+                os.chmod(str(log_dir), 0o777)
+        except Exception:
+            pass  # Ignore permission errors on Windows
         
         # Force unbuffered output
-        import sys
         if hasattr(sys.stdout, 'reconfigure'):
             sys.stdout.reconfigure(line_buffering=True)
         if hasattr(sys.stderr, 'reconfigure'):
@@ -144,50 +187,88 @@ class AdminTrainingLogger:
         
         log_file_path = log_dir / f"job_{self.job_id}.log"
         
+        # Try to create log file with error handling
+        handlers = [logging.StreamHandler(sys.stdout)]  # Always include console
+        
+        try:
+            # Test if we can write to the log file by actually trying to open it
+            test_handle = None
+            try:
+                test_handle = open(log_file_path, 'a', encoding='utf-8')
+                test_handle.write("")  # Try to write
+                test_handle.close()
+                
+                # If successful, add file handler
+                handlers.append(logging.FileHandler(log_file_path, mode='a', encoding='utf-8'))
+                # Use ASCII-safe message for Windows
+                print(f"[OK] Logging to file: {log_file_path.absolute()}", flush=True)
+            except (PermissionError, OSError) as e:
+                if test_handle:
+                    test_handle.close()
+                raise  # Re-raise to outer except
+        except (PermissionError, OSError) as e:
+            # Use ASCII-safe messages for Windows compatibility
+            print(f"[WARNING] Cannot write to log file {log_file_path}: {e}", flush=True)
+            print(f"[WARNING] Logging to console only. Check directory permissions.", flush=True)
+            # Continue with console-only logging
+        
         logging.basicConfig(
             level=logging.INFO,
             format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.FileHandler(log_file_path, mode='a', encoding='utf-8'),
-                logging.StreamHandler(sys.stdout)
-            ],
+            handlers=handlers,
             force=True
         )
         self.logger = logging.getLogger(__name__)
         
-        # Immediately write to log file to confirm it works
-        self.logger.info(f"Log file created: {log_file_path.absolute()}")
-        print(f"Logging to: {log_file_path.absolute()}", flush=True)
+        # Immediately write to log file to confirm it works (if file handler exists)
+        try:
+            if len(handlers) > 1:  # File handler was added
+                self.logger.info(f"Log file created: {log_file_path.absolute()}")
+            else:
+                self.logger.info("Logging to console only (file logging unavailable)")
+        except Exception:
+            # If even logging fails, just continue silently
+            pass
         sys.stdout.flush()
     
     def info(self, message):
         """Log info message"""
-        self.logger.info(message)
-        self.log_to_db('INFO', message)
+        # Ensure message is ASCII-safe for Windows
+        safe_message = str(message).encode('ascii', 'replace').decode('ascii')
+        self.logger.info(safe_message)
+        self.log_to_db('INFO', safe_message)
     
     def warning(self, message):
         """Log warning message"""
-        self.logger.warning(message)
-        self.log_to_db('WARNING', message)
+        # Ensure message is ASCII-safe for Windows
+        safe_message = str(message).encode('ascii', 'replace').decode('ascii')
+        self.logger.warning(safe_message)
+        self.log_to_db('WARNING', safe_message)
     
     def error(self, message):
         """Log error message"""
-        self.logger.error(message)
-        self.log_to_db('ERROR', message)
+        # Ensure message is ASCII-safe for Windows
+        safe_message = str(message).encode('ascii', 'replace').decode('ascii')
+        self.logger.error(safe_message)
+        self.log_to_db('ERROR', safe_message)
     
     def log_to_db(self, level, message):
-        """Log message to database"""
+        """Log message to database (optional - won't crash if DB unavailable)"""
         try:
+            # Ensure message is ASCII-safe
+            safe_message = str(message).encode('ascii', 'replace').decode('ascii')
             conn = pymysql.connect(**self.db_config)
             cursor = conn.cursor()
             cursor.execute(
                 "INSERT INTO training_logs (training_job_id, log_level, message) VALUES (%s, %s, %s)",
-                (self.job_id, level, message)
+                (self.job_id, level, safe_message)
             )
             conn.commit()
             conn.close()
         except Exception as e:
-            print(f"Failed to log to database: {e}")
+            # Silently fail - database logging is optional
+            # Don't print to avoid encoding issues and spam
+            pass
 
 class EnhancedPestDataset(Dataset):
     """Enhanced dataset with better error handling and statistics"""
@@ -341,12 +422,13 @@ class ModelTrainer:
             current_acc = 100. * correct / total if total > 0 else 0
             
             # Print progress every batch (like YOLOv8)
+            # Use ASCII-safe characters for Windows compatibility
             progress_bar_length = 30
             filled = int(progress_bar_length * batch_progress / 100)
-            bar = '█' * filled + '░' * (progress_bar_length - filled)
+            bar = '#' * filled + '-' * (progress_bar_length - filled)  # ASCII-safe progress bar
             
             # Format like YOLOv8: epoch/batch  loss  accuracy  progress_bar
-            progress_line = f"  {batch_idx+1}/{len(dataloader)}  {loss.item():.4f}  {current_acc:.1f}%  {bar} {batch_progress:.0f}%"
+            progress_line = f"  {batch_idx+1}/{len(dataloader)}  {loss.item():.4f}  {current_acc:.1f}%  [{bar}] {batch_progress:.0f}%"
             print(progress_line, end='\r', flush=True)
             
             # Also log every 10 batches
@@ -526,9 +608,11 @@ def update_job_status(job_id, status, error_message=None):
                 (status, job_id)
             )
         elif status == 'failed':
+            # Ensure error message is ASCII-safe
+            safe_error = str(error_message).encode('ascii', 'replace').decode('ascii') if error_message else None
             cursor.execute(
                 "UPDATE training_jobs SET status = %s, completed_at = NOW(), error_message = %s WHERE job_id = %s",
-                (status, error_message, job_id)
+                (status, safe_error, job_id)
             )
         else:
             cursor.execute(
@@ -539,7 +623,9 @@ def update_job_status(job_id, status, error_message=None):
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"Failed to update job status: {e}")
+        # Silently fail - database updates are optional
+        # Don't print to avoid encoding issues
+        pass
 
 def create_combined_dataset(logger):
     """Create combined dataset from original and collected data"""
@@ -736,8 +822,10 @@ def main():
         logger.info(f"Training completed successfully! Best accuracy: {trainer.best_accuracy:.2f}%")
         
     except Exception as e:
-        logger.error(f"Training failed: {str(e)}")
-        update_job_status(args.job_id, 'failed', str(e))
+        # Ensure error message is ASCII-safe
+        error_msg = str(e).encode('ascii', 'replace').decode('ascii')
+        logger.error(f"Training failed: {error_msg}")
+        update_job_status(args.job_id, 'failed', error_msg)  # Use ASCII-safe error message
         sys.exit(1)
 
 if __name__ == "__main__":

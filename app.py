@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 import logging
 import threading
 import time
+import requests
 
 # Try to load environment variables
 try:
@@ -30,7 +31,7 @@ except ImportError:
 try:
     from config import (
         FLASK_HOST, FLASK_PORT, FLASK_DEBUG,
-        DB_CONFIG, MODEL_PATHS, DEFAULT_LOCATION, LOG_LEVEL,
+        DB_CONFIG, MODEL_PATHS, DEFAULT_LOCATION, LOG_LEVEL, PHP_BASE_URL,
         # Detection settings
         YOLO_IMAGE_SIZE, YOLO_BASE_CONFIDENCE, YOLO_IOU_THRESHOLD, YOLO_DEVICE,
         CONFIDENCE_THRESHOLDS, CONFIDENCE_FALLBACK,
@@ -51,7 +52,7 @@ except ImportError:
     # Fallback if config.py doesn't exist
     USE_CONFIG_FILE = False
     FLASK_HOST = os.getenv('FLASK_HOST', '0.0.0.0')
-    FLASK_PORT = int(os.getenv('FLASK_PORT', '8000'))
+    FLASK_PORT = int(os.getenv('FLASK_PORT', '5001'))  # Changed to 5001 to match PHP calls
     FLASK_DEBUG = os.getenv('FLASK_DEBUG', 'False').lower() == 'true'
     DB_CONFIG = {
         'host': os.getenv('DB_HOST', 'localhost'),
@@ -136,15 +137,69 @@ CORS(app)  # Enable CORS for all origins
 
 # Configuration
 BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = MODEL_PATHS[0] if MODEL_PATHS else BASE_DIR / 'ml_models' / 'pest_detection' / 'best.pt'
 POSSIBLE_MODEL_PATHS = MODEL_PATHS
 
-CLASS_NAMES = [
-    'Rice_Bug',
-    'black-bug',
-    'brown_hopper',
-    'green_hopper',
-]
+# Class names will be loaded dynamically from the model
+CLASS_NAMES = []
+
+
+# === Get Active Model Path (from database or fallback) ===
+def get_active_model_path() -> str:
+    """Fetch the currently active model path from the database"""
+    try:
+        # Get PHP base URL from config (production-ready)
+        try:
+            from config import PHP_BASE_URL
+            php_base = PHP_BASE_URL
+        except ImportError:
+            php_base = os.getenv('PHP_BASE_URL', 'http://localhost/Proto1')
+        
+        # Call PHP endpoint to get active model
+        php_url = f"{php_base}/pest_detection_ml/api/get_active_model_path.php"
+        response = requests.get(php_url, timeout=5)
+        if response.status_code == 200:
+            data = response.json()
+            if data.get('success'):
+                model_path = data.get('model_path')
+                if model_path and os.path.exists(model_path):
+                    logger.info(f"✅ Using active model: {os.path.basename(model_path)}")
+                    return model_path
+    except Exception as e:
+        logger.warning(f"⚠️ Could not get active model from database: {e}")
+    
+    # Fallback to default model - using "best 2.pt" from datasets folder
+    base_dir = BASE_DIR.parent  # Go up one level from AgriShield_ML_Flask to Proto1
+    datasets_model = base_dir / "datasets" / "best 2.pt"
+    if datasets_model.exists():
+        logger.info(f"✅ Using default model: best 2.pt (from datasets folder)")
+        return str(datasets_model)
+    
+    # Secondary fallback to models folder
+    fallback = base_dir / "pest_detection_ml" / "models" / "best.pt"
+    if fallback.exists():
+        logger.info(f"⚠️ Using fallback model: best.pt (from models folder)")
+        return str(fallback)
+    
+    # Try POSSIBLE_MODEL_PATHS as last resort
+    for path in POSSIBLE_MODEL_PATHS:
+        full_path = Path(path).resolve()
+        if full_path.exists():
+            logger.info(f"✅ Using model from POSSIBLE_MODEL_PATHS: {full_path}")
+            return str(full_path)
+    
+    # If neither exists, return datasets path (will show error when loading)
+    logger.error(f"❌ Model not found: {datasets_model}")
+    return str(datasets_model)
+
+# Get model path (will use active model from database)
+# Note: This is called at module load time, but model is loaded lazily
+try:
+    MODEL_PATH = get_active_model_path()
+except Exception as e:
+    logger.warning(f"Could not determine model path at startup: {e}")
+    # Fallback to default
+    BASE_DIR = Path(__file__).resolve().parent
+    MODEL_PATH = str(BASE_DIR.parent / "datasets" / "best 2.pt")
 
 # Pest information
 PEST_INFO = {
@@ -210,31 +265,38 @@ _model_cache = None
 _loaded_model_path = None
 
 def load_yolo_model():
-    """Load YOLO model for pest detection"""
-    global _model_cache, _loaded_model_path
+    """Load YOLO model for pest detection with dynamic class loading"""
+    global _model_cache, _loaded_model_path, CLASS_NAMES
     
     if _model_cache is not None:
         return _model_cache
     
-    # Try to find model file
-    model_path = None
-    for path in POSSIBLE_MODEL_PATHS:
-        full_path = Path(path).resolve()
-        if full_path.exists():
-            model_path = full_path
-            logger.info(f"📁 Found YOLO model at: {model_path}")
-            break
+    # Use MODEL_PATH from get_active_model_path()
+    model_path = MODEL_PATH
     
-    if not model_path:
-        error_msg = f"No YOLO model found in Flask folder.\n"
-        error_msg += f"Checked locations:\n"
-        for i, path in enumerate(POSSIBLE_MODEL_PATHS[:6], 1):  # Show first 6
-            error_msg += f"  {i}. {Path(path).resolve()}\n"
-        error_msg += f"\nPlace your model file (best.pt) in one of these locations."
+    if not os.path.exists(model_path):
+        error_msg = f"Model weights not found at {model_path}. Ensure training completed and path is correct."
         raise FileNotFoundError(error_msg)
     
     _loaded_model_path = str(model_path)
     _model_cache = YOLO(str(model_path))
+    
+    # Get class names dynamically from the model
+    if hasattr(_model_cache, 'names') and _model_cache.names:
+        CLASS_NAMES.clear()
+        CLASS_NAMES.extend([_model_cache.names[i] for i in sorted(_model_cache.names.keys())])
+        logger.info(f"✅ Loaded {len(CLASS_NAMES)} classes from model: {CLASS_NAMES}")
+    else:
+        # Fallback to default if model doesn't have names
+        if not CLASS_NAMES:
+            CLASS_NAMES.extend([
+                "Rice_Bug",
+                "black-bug",
+                "brown_hopper",
+                "green_hopper",
+            ])
+        logger.warning(f"⚠️ Model doesn't have class names, using fallback: {CLASS_NAMES}")
+    
     logger.info(f"✅ YOLO model loaded successfully from: {model_path}")
     return _model_cache
 
@@ -412,7 +474,8 @@ def health_check():
             "model": model_name,
             "model_path": model_path,
             "model_loaded": model_loaded,
-            "classes": CLASS_NAMES,
+            "classes": CLASS_NAMES if CLASS_NAMES else ["Loading..."],
+            "num_classes": len(CLASS_NAMES) if CLASS_NAMES else 0,
             "api": "Flask",
             "version": "1.0",
             "flask_folder": str(BASE_DIR)
@@ -472,9 +535,128 @@ def detect():
                 "error": f"Invalid image: {e}"
             }), 400
         
-        # Run detection
-        result = run_detection(img)
-        return jsonify(result)
+        # Load model if not loaded
+        model = load_yolo_model()
+        
+        # Run detection with improved logic
+        t0 = time.time()
+        results = model.predict(img, imgsz=512, conf=0.15, iou=0.50, device="cpu")
+        dt = time.time() - t0
+        
+        # Dynamic confidence thresholds - can be customized per model
+        class_conf_thresholds = {
+            "Rice_Bug": 0.20,
+            "black-bug": 0.80,       # Very high threshold to reduce black-bug bias
+            "brown_hopper": 0.15,
+            "green_hopper": 0.15,
+            "stem_borer": 0.20,
+            "white_stem_borer": 0.20,
+            "White_Stem_Borer": 0.20,
+        }
+        # Use CONFIDENCE_THRESHOLDS from config if available, otherwise use defaults
+        for key, value in CONFIDENCE_THRESHOLDS.items():
+            if key not in class_conf_thresholds:
+                class_conf_thresholds[key] = value
+        
+        # Optional: allow disabling black-bug via query param ?disable_black=1
+        if request.args.get("disable_black") == "1":
+            class_conf_thresholds["black-bug"] = 1.0
+        
+        # Aggregate counts with class-specific filtering
+        counts: Dict[str, int] = {name: 0 for name in CLASS_NAMES}
+        pred = results[0] if results else None
+        if pred is not None and getattr(pred, "boxes", None) is not None:
+            boxes = pred.boxes
+            try:
+                num = len(boxes)
+            except Exception:
+                num = 0
+            for i in range(num):
+                try:
+                    cls_idx = int(boxes.cls[i].item()) if hasattr(boxes.cls, 'shape') else int(boxes.cls.tolist()[i])
+                    conf = float(boxes.conf[i].item()) if hasattr(boxes.conf, 'shape') else float(boxes.conf.tolist()[i])
+                    if 0 <= cls_idx < len(CLASS_NAMES):
+                        name = CLASS_NAMES[cls_idx]
+                        # Apply class-specific confidence filtering
+                        threshold = class_conf_thresholds.get(name, CONFIDENCE_FALLBACK)
+                        if conf >= threshold:
+                            counts[name] += 1
+                except Exception:
+                    continue
+        
+        # Dynamic pesticide recommendations - extend existing PESTICIDE_RECS
+        pesticide_recs = PESTICIDE_RECS.copy()
+        pesticide_recs.update({
+            "stem_borer": "Chlorantraniliprole or fipronil at early stage; remove stubble after harvest.",
+            "white_stem_borer": "Chlorantraniliprole or fipronil at early stage; remove stubble after harvest.",
+            "White_Stem_Borer": "Chlorantraniliprole or fipronil at early stage; remove stubble after harvest.",
+        })
+        
+        # Dynamic pest diseases - extend existing PEST_DISEASES
+        pest_diseases = PEST_DISEASES.copy()
+        pest_diseases.update({
+            "stem_borer": [
+                "Dead hearts (at tillering stage)",
+                "White heads (at heading stage)"
+            ],
+            "white_stem_borer": [
+                "Dead hearts (at tillering stage)",
+                "White heads (at heading stage)"
+            ],
+            "White_Stem_Borer": [
+                "Dead hearts (at tillering stage)",
+                "White heads (at heading stage)"
+            ],
+        })
+        
+        # Filter recommendations to only detected pests (>0)
+        recommendations = {k: v for k, v in pesticide_recs.items() if counts.get(k, 0) > 0}
+        diseases = {k: pest_diseases.get(k, []) for k, v in counts.items() if v > 0}
+        
+        # Build response with compatibility for existing format
+        total_pests = sum(counts.values())
+        top_pest = max(counts, key=counts.get) if total_pests > 0 else None
+        top_info = PEST_INFO.get(top_pest, {}) if top_pest else {}
+        
+        response_payload = {
+            "status": "success",
+            "pest_counts": counts,
+            "total_pests_detected": total_pests,
+            "diseases": diseases,
+            "recommendations": recommendations,
+            "inference_time_ms": round(dt * 1000, 1),
+            "model": os.path.basename(str(MODEL_PATH)),
+            # Compatibility fields
+            "predicted_class": top_info.get("scientific_name", top_pest) if top_pest else "no_pest_detected",
+            "common_name": top_info.get("common_name", top_pest) if top_pest else "No Pest Detected",
+            "filipino_name": top_info.get("filipino_name", "") if top_pest else "",
+            "description": pesticide_recs.get(top_pest, "") if top_pest else "",
+            "treatment": pesticide_recs.get(top_pest, "") if top_pest else "",
+            "source": "yolo_detection"
+        }
+        
+        # Optional debug: return raw detections
+        if request.args.get("debug") == "1" and results and results[0] and getattr(results[0], "boxes", None):
+            dets = []
+            try:
+                boxes = results[0].boxes
+                for i in range(len(boxes)):
+                    cls_idx = int(boxes.cls[i].item()) if hasattr(boxes.cls, 'shape') else int(boxes.cls.tolist()[i])
+                    conf = float(boxes.conf[i].item()) if hasattr(boxes.conf, 'shape') else float(boxes.conf.tolist()[i])
+                    name = CLASS_NAMES[cls_idx] if 0 <= cls_idx < len(CLASS_NAMES) else str(cls_idx)
+                    box = boxes.xyxy[i].tolist() if hasattr(boxes, 'xyxy') else [0, 0, 0, 0]
+                    dets.append({
+                        "class": name,
+                        "confidence": round(conf, 3),
+                        "bbox": [round(x, 2) for x in box]
+                    })
+            except Exception:
+                pass
+            response_payload["detections"] = dets
+            response_payload["all_predictions"] = dets
+            response_payload["predictions"] = dets
+        
+        return jsonify(response_payload)
         
     except FileNotFoundError as e:
         logger.error(f"Model not found: {e}")
@@ -1339,7 +1521,13 @@ if __name__ == '__main__':
     print("🌾 AgriShield ML Flask API")
     print("=" * 70)
     print(f"Model path: {MODEL_PATH}")
-    print(f"Classes: {CLASS_NAMES}")
+    # Load model to get classes
+    try:
+        model = load_yolo_model()
+        print(f"Classes: {CLASS_NAMES if CLASS_NAMES else 'Loading...'}")
+    except Exception as e:
+        print(f"⚠️ Could not load model: {e}")
+        print(f"Classes: {CLASS_NAMES if CLASS_NAMES else 'Not loaded'}")
     print()
     print(f"Starting Flask API on port {FLASK_PORT}...")
     print()
@@ -1359,8 +1547,11 @@ if __name__ == '__main__':
     print()
     print("🔄 Auto-Update: Forecast updates automatically every 6 hours")
     print()
-    print(f"Access from LAN: http://your-server-ip:{FLASK_PORT}")
-    print(f"Local access: http://localhost:{FLASK_PORT}")
+    if FLASK_DEBUG:
+        print(f"Access from LAN: http://your-server-ip:{FLASK_PORT}")
+        print(f"Local access: http://localhost:{FLASK_PORT}")
+    else:
+        print(f"Production mode: API running on port {FLASK_PORT}")
     print("=" * 70)
     
     # Start background thread for automatic forecast updates
