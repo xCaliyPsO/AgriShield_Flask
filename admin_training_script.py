@@ -37,6 +37,7 @@ from pathlib import Path
 from datetime import datetime
 import numpy as np
 import re
+import yaml
 
 print("[OK] All imports successful", flush=True)
 sys.stdout.flush()
@@ -273,12 +274,13 @@ class AdminTrainingLogger:
 class EnhancedPestDataset(Dataset):
     """Enhanced dataset with better error handling and statistics"""
     
-    def __init__(self, data_dir, transform=None, logger=None):
+    def __init__(self, data_dir, transform=None, logger=None, classes_from_yaml=None):
         self.data_dir = Path(data_dir)
         self.transform = transform
         self.logger = logger
         self.samples = []
         self.class_counts = {}
+        self.classes_from_yaml = classes_from_yaml  # Classes from data.yaml
         
         self._load_dataset()
     
@@ -289,13 +291,20 @@ class EnhancedPestDataset(Dataset):
                 self.logger.error(f"Dataset directory not found: {self.data_dir}")
             return
         
-        # Get pest classes
-        self.classes = [d.name for d in self.data_dir.iterdir() if d.is_dir()]
-        self.classes.sort()
-        self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
-        
-        if self.logger:
-            self.logger.info(f"Found classes: {self.classes}")
+        # PRIORITY: Use classes from YAML if provided, otherwise detect from directories
+        if self.classes_from_yaml:
+            self.classes = self.classes_from_yaml.copy()
+            self.classes.sort()
+            self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
+            if self.logger:
+                self.logger.info(f"Using classes from data.yaml: {self.classes}")
+        else:
+            # Fallback: Get pest classes from directory structure
+            self.classes = [d.name for d in self.data_dir.iterdir() if d.is_dir()]
+            self.classes.sort()
+            self.class_to_idx = {cls_name: idx for idx, cls_name in enumerate(self.classes)}
+            if self.logger:
+                self.logger.info(f"Found classes from directory structure: {self.classes}")
         
         # Collect all image paths and labels
         for class_name in self.classes:
@@ -488,6 +497,9 @@ class ModelTrainer:
         
         # Create model
         num_classes = len(train_dataset.classes)
+        self.logger.info(f"Dataset contains {num_classes} classes: {train_dataset.classes}")
+        print(f"Number of classes detected: {num_classes}", flush=True)
+        print(f"Classes: {train_dataset.classes}", flush=True)
         model = self.create_model(num_classes)
         model = model.to(self.device)
         
@@ -627,6 +639,30 @@ def update_job_status(job_id, status, error_message=None):
         # Don't print to avoid encoding issues
         pass
 
+def load_classes_from_yaml(yaml_path):
+    """Load class names from data.yaml file"""
+    try:
+        with open(yaml_path, 'r', encoding='utf-8') as f:
+            yaml_data = yaml.safe_load(f)
+        
+        # Try to get names from yaml
+        if 'names' in yaml_data:
+            names = yaml_data['names']
+            # Handle both list and dict formats
+            if isinstance(names, list):
+                # Convert display names back to class codes (lowercase, replace spaces with underscores)
+                class_codes = [name.lower().replace(' ', '_').replace('-', '_') for name in names]
+                return class_codes
+            elif isinstance(names, dict):
+                # If it's a dict like {0: 'class1', 1: 'class2'}, get values
+                class_codes = [name.lower().replace(' ', '_').replace('-', '_') for name in names.values()]
+                return class_codes
+        
+        return None
+    except Exception as e:
+        print(f"Warning: Could not load classes from {yaml_path}: {e}", flush=True)
+        return None
+
 def create_combined_dataset(logger):
     """Create combined dataset from original and collected data"""
     import sys
@@ -635,10 +671,204 @@ def create_combined_dataset(logger):
     
     # Directories - use parent directory (Proto1/)
     script_dir = Path(__file__).resolve().parent.parent
+    
+    # PRIORITY 1: Check for organized dataset from smart import (has data.yaml)
+    organized_dir = script_dir / "training_data" / "dataset_organized"
+    organized_yaml = organized_dir / "data.yaml"
+    
+    # Always try to load classes from data.yaml first (from organized dataset created during import)
+    pest_classes = load_classes_from_yaml(organized_yaml)
+    
+    if organized_yaml.exists():
+        if pest_classes:
+            print(f"[OK] Found data.yaml from import", flush=True)
+            print(f"  Loaded {len(pest_classes)} classes from data.yaml: {pest_classes}", flush=True)
+            logger.info(f"Loaded {len(pest_classes)} classes from data.yaml: {pest_classes}")
+        else:
+            print(f"Warning: data.yaml exists but could not parse classes", flush=True)
+            logger.warning("data.yaml exists but could not parse classes")
+    
+    # Check if organized dataset exists (from smart import)
+    organized_train_images = organized_dir / "train" / "images"
+    organized_train_labels = organized_dir / "train" / "labels"
+    organized_val_images = organized_dir / "valid" / "images"
+    organized_val_labels = organized_dir / "valid" / "labels"
+    
+    # PRIORITY 1A: Use database to get images (most reliable - images are stored with pest_class)
+    if organized_yaml.exists() and pest_classes:
+        print(f"[INFO] Checking database for imported images...", flush=True)
+        logger.info("Checking database for imported images")
+        
+        try:
+            conn = pymysql.connect(**DB_CONFIG)
+            cursor = conn.cursor()
+            
+            # Get all images from training_images table
+            cursor.execute("SELECT file_path, pest_class FROM training_images WHERE is_verified = 1")
+            db_images = cursor.fetchall()
+            conn.close()
+            
+            if db_images and len(db_images) > 0:
+                print(f"[OK] Found {len(db_images)} images in database", flush=True)
+                logger.info(f"Found {len(db_images)} images in database")
+                
+                # Create classification-ready dataset structure
+                classification_train_dir = organized_dir / "classification" / "train"
+                classification_val_dir = organized_dir / "classification" / "val"
+                
+                # Create class folders
+                for split_dir in [classification_train_dir, classification_val_dir]:
+                    split_dir.mkdir(parents=True, exist_ok=True)
+                    for class_name in pest_classes:
+                        (split_dir / class_name).mkdir(exist_ok=True)
+                
+                # Normalize pest_class names to match YAML classes (handle variations)
+                def normalize_class_name(db_class):
+                    """Normalize database class name to match YAML class names"""
+                    db_class_lower = db_class.lower().replace(' ', '_').replace('-', '_')
+                    # Try exact match first
+                    for yaml_class in pest_classes:
+                        if db_class_lower == yaml_class.lower():
+                            return yaml_class
+                    # Try partial match
+                    for yaml_class in pest_classes:
+                        if yaml_class.lower() in db_class_lower or db_class_lower in yaml_class.lower():
+                            return yaml_class
+                    return None
+                
+                # Reorganize images from database
+                import random
+                random.seed(42)
+                train_count = 0
+                val_count = 0
+                
+                for file_path, db_pest_class in db_images:
+                    img_path = Path(file_path)
+                    if not img_path.exists():
+                        # Try relative path from script directory
+                        img_path = script_dir / file_path.lstrip('/')
+                        if not img_path.exists():
+                            continue
+                    
+                    # Normalize class name
+                    class_name = normalize_class_name(db_pest_class)
+                    if not class_name:
+                        logger.warning(f"Could not map database class '{db_pest_class}' to YAML classes")
+                        continue
+                    
+                    # Split 80% train, 20% val
+                    is_train = random.random() < 0.8
+                    dest_dir = classification_train_dir if is_train else classification_val_dir
+                    dest = dest_dir / class_name / img_path.name
+                    
+                    if not dest.exists():
+                        try:
+                            shutil.copy2(img_path, dest)
+                            if is_train:
+                                train_count += 1
+                            else:
+                                val_count += 1
+                        except Exception as e:
+                            logger.warning(f"Error copying {img_path}: {e}")
+                            continue
+                
+                if train_count > 0 or val_count > 0:
+                    print(f"[OK] Reorganized {len(db_images)} images from database: {train_count} train, {val_count} val", flush=True)
+                    logger.info(f"Reorganized {len(db_images)} images from database: {train_count} train, {val_count} val")
+                    print(f"  Using reorganized dataset at: {classification_train_dir}", flush=True)
+                    sys.stdout.flush()
+                    return classification_train_dir, classification_val_dir, pest_classes
+                else:
+                    print(f"[WARN] Could not copy images from database, trying YOLO labels...", flush=True)
+                    logger.warning("Could not copy images from database, trying YOLO labels")
+            else:
+                print(f"[INFO] No images found in database, trying YOLO format...", flush=True)
+                logger.info("No images found in database, trying YOLO format")
+        except Exception as e:
+            print(f"[WARN] Database query failed: {e}, trying YOLO format...", flush=True)
+            logger.warning(f"Database query failed: {e}, trying YOLO format")
+    
+    # PRIORITY 1B: Reorganize from YOLO format (if database method didn't work)
+    if organized_yaml.exists() and organized_train_images.exists() and pest_classes:
+        print(f"[INFO] Found organized dataset from import, reorganizing from YOLO format...", flush=True)
+        logger.info("Reorganizing organized dataset from YOLO format into class folders")
+        
+        # Create classification-ready dataset structure
+        classification_train_dir = organized_dir / "classification" / "train"
+        classification_val_dir = organized_dir / "classification" / "val"
+        
+        # Create class folders
+        for split_dir in [classification_train_dir, classification_val_dir]:
+            split_dir.mkdir(parents=True, exist_ok=True)
+            for class_name in pest_classes:
+                (split_dir / class_name).mkdir(exist_ok=True)
+        
+        # Function to reorganize images based on YOLO labels
+        def reorganize_from_yolo(images_dir, labels_dir, output_dir, split_name):
+            if not images_dir.exists():
+                print(f"  [WARN] Images directory not found: {images_dir}", flush=True)
+                return 0
+            if not labels_dir.exists():
+                print(f"  [WARN] Labels directory not found: {labels_dir}", flush=True)
+                return 0
+            
+            reorganized_count = 0
+            images = list(images_dir.glob('*.jpg')) + list(images_dir.glob('*.jpeg')) + list(images_dir.glob('*.png'))
+            print(f"  [INFO] Found {len(images)} images in {images_dir}", flush=True)
+            
+            for img_path in images:
+                label_path = labels_dir / (img_path.stem + '.txt')
+                if label_path.exists():
+                    # Read first line of label to get class index
+                    try:
+                        with open(label_path, 'r') as f:
+                            first_line = f.readline().strip()
+                            if first_line:
+                                parts = first_line.split()
+                                if len(parts) >= 5:
+                                    class_index = int(parts[0])
+                                    # Map class index to class name (assuming indices match YAML order)
+                                    if class_index < len(pest_classes):
+                                        class_name = pest_classes[class_index]
+                                        # Copy image to class folder
+                                        dest = output_dir / class_name / img_path.name
+                                        if not dest.exists():  # Avoid duplicates
+                                            shutil.copy2(img_path, dest)
+                                            reorganized_count += 1
+                    except Exception as e:
+                        logger.warning(f"Error processing {img_path}: {e}")
+                        continue
+            
+            return reorganized_count
+        
+        # Reorganize train and val sets
+        train_count = reorganize_from_yolo(organized_train_images, organized_train_labels, classification_train_dir, "train")
+        val_count = reorganize_from_yolo(organized_val_images, organized_val_labels, classification_val_dir, "val")
+        
+        if train_count > 0 or val_count > 0:
+            print(f"[OK] Reorganized dataset from YOLO: {train_count} train images, {val_count} val images", flush=True)
+            logger.info(f"Reorganized dataset from YOLO: {train_count} train images, {val_count} val images")
+            print(f"  Using reorganized dataset at: {classification_train_dir}", flush=True)
+            sys.stdout.flush()
+            return classification_train_dir, classification_val_dir, pest_classes
+        else:
+            print(f"[WARN] No images found in organized dataset, falling back...", flush=True)
+            logger.warning("No images found in organized dataset, falling back")
+    
+    # PRIORITY 2: Fallback to old dataset structure (only if organized dataset doesn't exist or has no images)
     original_train_dir = script_dir / "ml_training" / "datasets" / "processed" / "train"
     original_val_dir = script_dir / "ml_training" / "datasets" / "processed" / "val"
     collected_data_dir = script_dir / "ml_training" / "datasets" / "auto_collected"
     combined_dir = script_dir / "ml_training" / "datasets" / "combined"
+    
+    # Fallback to hardcoded classes if yaml not found
+    if not pest_classes:
+        print("Warning: data.yaml not found, using default classes", flush=True)
+        logger.warning("data.yaml not found, using default classes")
+        pest_classes = ['leptocorisa_oratorius', 'nephotettix_virescens', 'nilaparvata_lugens', 'scotinophara_coarctata', 'scirpophaga_incertulas']
+    else:
+        print(f"Loaded {len(pest_classes)} classes from data.yaml: {pest_classes}", flush=True)
+        logger.info(f"Loaded {len(pest_classes)} classes from data.yaml: {pest_classes}")
     
     print(f"Checking directories...", flush=True)
     print(f"  Train dir: {original_train_dir} (exists: {original_train_dir.exists()})", flush=True)
@@ -669,10 +899,10 @@ def create_combined_dataset(logger):
             print(f"  Train: {original_train_dir}", flush=True)
             print(f"  Val: {original_val_dir}", flush=True)
             sys.stdout.flush()
-            return original_train_dir, original_val_dir
+            return original_train_dir, original_val_dir, pest_classes
         else:
             print(f"[WARN] Val dir missing, using train for both", flush=True)
-            return original_train_dir, original_train_dir
+            return original_train_dir, original_train_dir, pest_classes
     
     # Only create combined dataset if original doesn't exist
     print("Creating combined dataset structure...", flush=True)
@@ -681,12 +911,12 @@ def create_combined_dataset(logger):
     
     for split_dir in [combined_train_dir, combined_val_dir]:
         split_dir.mkdir(parents=True, exist_ok=True)
-        for class_name in ['leptocorisa_oratorius', 'nephotettix_virescens', 'nilaparvata_lugens', 'scotinophara_coarctata']:
+        for class_name in pest_classes:
             (split_dir / class_name).mkdir(exist_ok=True)
     
     # Copy original training data
     logger.info("Copying original training data...")
-    for class_name in ['leptocorisa_oratorius', 'nephotettix_virescens', 'nilaparvata_lugens', 'scotinophara_coarctata']:
+    for class_name in pest_classes:
         # Copy original train data
         original_train_class_dir = original_train_dir / class_name
         if original_train_class_dir.exists():
@@ -708,7 +938,7 @@ def create_combined_dataset(logger):
     import random
     random.seed(42)
     
-    for class_name in ['leptocorisa_oratorius', 'nephotettix_virescens', 'nilaparvata_lugens', 'scotinophara_coarctata']:
+    for class_name in pest_classes:
         collected_class_dir = collected_data_dir / class_name
         if collected_class_dir.exists():
             images = [f for f in collected_class_dir.glob('*') if f.suffix.lower() in ['.jpg', '.jpeg', '.png']]
@@ -733,7 +963,7 @@ def create_combined_dataset(logger):
                 
                 logger.info(f"{class_name}: +{len(images)} collected images ({len(train_images)} train, {len(val_images)} val)")
     
-    return combined_train_dir, combined_val_dir
+    return combined_train_dir, combined_val_dir, pest_classes
 
 def main():
     """Main training function"""
@@ -771,8 +1001,10 @@ def main():
         try:
             print("Creating dataset...", flush=True)
             sys.stdout.flush()
-            train_dir, val_dir = create_combined_dataset(logger)
+            train_dir, val_dir, classes_from_yaml = create_combined_dataset(logger)
             print(f"[OK] Dataset created: Train={train_dir}, Val={val_dir}", flush=True)
+            if classes_from_yaml:
+                print(f"[OK] Classes from data.yaml: {len(classes_from_yaml)} classes - {classes_from_yaml}", flush=True)
             sys.stdout.flush()
         except Exception as e:
             import traceback
@@ -800,11 +1032,24 @@ def main():
         
         # Create datasets
         print("Loading datasets...", flush=True)
+        print(f"  Train directory: {train_dir}", flush=True)
+        print(f"  Val directory: {val_dir}", flush=True)
+        if classes_from_yaml:
+            print(f"  Classes from data.yaml: {len(classes_from_yaml)} classes - {classes_from_yaml}", flush=True)
         sys.stdout.flush()
         logger.info("Loading datasets...")
-        train_dataset = EnhancedPestDataset(train_dir, transform=train_transforms, logger=logger)
-        val_dataset = EnhancedPestDataset(val_dir, transform=val_transforms, logger=logger)
+        logger.info(f"Train directory: {train_dir}")
+        logger.info(f"Val directory: {val_dir}")
+        if classes_from_yaml:
+            logger.info(f"Classes from data.yaml: {classes_from_yaml}")
+        
+        # Pass classes from YAML to dataset class so it uses the correct number of classes
+        train_dataset = EnhancedPestDataset(train_dir, transform=train_transforms, logger=logger, classes_from_yaml=classes_from_yaml)
+        val_dataset = EnhancedPestDataset(val_dir, transform=val_transforms, logger=logger, classes_from_yaml=classes_from_yaml)
+        
         print(f"[OK] Datasets loaded: Train={len(train_dataset)} samples, Val={len(val_dataset)} samples", flush=True)
+        print(f"[INFO] Number of classes detected: {len(train_dataset.classes)}", flush=True)
+        print(f"[INFO] Classes: {train_dataset.classes}", flush=True)
         sys.stdout.flush()
         
         # Log dataset statistics
@@ -813,6 +1058,8 @@ def main():
         
         logger.info(f"Training dataset: {train_stats}")
         logger.info(f"Validation dataset: {val_stats}")
+        logger.info(f"Number of classes: {len(train_dataset.classes)}")
+        logger.info(f"Classes: {train_dataset.classes}")
         
         # Start training
         model = trainer.train(train_dataset, val_dataset)
