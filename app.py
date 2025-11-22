@@ -757,6 +757,99 @@ def detect():
             response_payload["all_predictions"] = dets
             response_payload["predictions"] = dets
         
+        # Save detection to database if device_id is provided (for Android app)
+        try:
+            device_id = request.form.get('device_id') or request.args.get('device_id')
+            farmer_id = request.form.get('farmer_id') or request.args.get('farmer_id')
+            latitude = request.form.get('latitude') or request.args.get('latitude')
+            longitude = request.form.get('longitude') or request.args.get('longitude')
+            
+            if device_id and DB_AVAILABLE and total_pests > 0:
+                # Save image file
+                import uuid
+                from datetime import datetime
+                
+                # Create uploads directory if it doesn't exist
+                uploads_dir = BASE_DIR.parent / "uploads"
+                uploads_dir.mkdir(parents=True, exist_ok=True)
+                
+                # Generate unique filename
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                unique_id = str(uuid.uuid4())[:8]
+                file_ext = file.filename.split('.')[-1] if '.' in file.filename else 'jpg'
+                filename = f"{timestamp}_{unique_id}.{file_ext}"
+                filepath = uploads_dir / filename
+                
+                # Save image
+                file.seek(0)  # Reset file pointer
+                with open(filepath, 'wb') as f:
+                    f.write(image_bytes)
+                
+                # Save to database
+                connection = pymysql.connect(**DB_CONFIG)
+                cursor = connection.cursor()
+                
+                # Prepare classification data as JSON (matches classification_json column)
+                classification_json = json.dumps({
+                    'pest_counts': counts,
+                    'total_pests': total_pests,
+                    'top_pest': top_pest,
+                    'detections': dets if request.args.get("debug") == "1" else [],
+                    'recommendations': recommendations,
+                    'diseases': diseases
+                })
+                
+                # Get image size
+                image_size = len(image_bytes)
+                
+                # Get additional fields from request
+                parcel_ref = request.form.get('parcel_ref') or request.args.get('parcel_ref')
+                gps_accuracy = request.form.get('gps_accuracy') or request.args.get('gps_accuracy')
+                location_timestamp = request.form.get('location_timestamp') or request.args.get('location_timestamp')
+                
+                # Insert into inbox_image table (matching exact table structure)
+                insert_query = """
+                    INSERT INTO inbox_image 
+                    (device_id, parcel_ref, image_path, image_size, created_at, classification_json, 
+                     gps_latitude, gps_longitude, gps_accuracy, location_timestamp)
+                    VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s)
+                """
+                
+                image_path_relative = f"uploads/{filename}"
+                
+                cursor.execute(insert_query, (
+                    device_id,
+                    parcel_ref if parcel_ref else None,
+                    image_path_relative,
+                    image_size,
+                    classification_json,
+                    float(latitude) if latitude else None,
+                    float(longitude) if longitude else None,
+                    float(gps_accuracy) if gps_accuracy else None,
+                    location_timestamp if location_timestamp else None
+                ))
+                
+                connection.commit()
+                cursor.close()
+                connection.close()
+                
+                logger.info(f"✅ Saved detection to database: device_id={device_id}, pests={total_pests}, file={filename}")
+                response_payload["saved_to_db"] = True
+                response_payload["image_path"] = image_path_relative
+            else:
+                if not device_id:
+                    logger.debug("No device_id provided, skipping database save")
+                elif not DB_AVAILABLE:
+                    logger.warning("Database not available, skipping save")
+                elif total_pests == 0:
+                    logger.debug("No pests detected, skipping database save")
+        except Exception as e:
+            logger.error(f"Error saving to database: {e}")
+            import traceback
+            traceback.print_exc()
+            # Don't fail the request if database save fails
+            response_payload["db_save_error"] = str(e)
+        
         return jsonify(response_payload)
         
     except FileNotFoundError as e:
