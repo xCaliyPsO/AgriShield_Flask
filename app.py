@@ -143,6 +143,86 @@ POSSIBLE_MODEL_PATHS = MODEL_PATHS
 CLASS_NAMES = []
 
 
+# === Model Download Function (for Heroku/external storage) ===
+def download_model_if_needed(model_url: str = None, save_path: str = None) -> str:
+    """
+    Download model from external storage if not exists (for Heroku deployment)
+    
+    Args:
+        model_url: URL to download model from (Google Drive, S3, GitHub, etc.)
+        save_path: Local path to save the model
+    
+    Returns:
+        Path to model file
+    """
+    if save_path is None:
+        save_path = BASE_DIR / "models" / "best.pt"
+    else:
+        save_path = Path(save_path)
+    
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # If model already exists, use it
+    if save_path.exists():
+        logger.info(f"✅ Model already exists at {save_path}")
+        return str(save_path)
+    
+    # Get download URL from environment variable if not provided
+    if model_url is None:
+        model_url = os.getenv('MODEL_DOWNLOAD_URL')
+    
+    # If no download URL, try fallback paths
+    if not model_url:
+        logger.warning("⚠️ MODEL_DOWNLOAD_URL not set, trying fallback paths...")
+        # Try fallback paths (for local development)
+        base_dir = BASE_DIR.parent
+        fallback_paths = [
+            base_dir / "datasets" / "best 2.pt",
+            base_dir / "pest_detection_ml" / "models" / "best.pt",
+            base_dir / "models" / "best.pt",
+        ]
+        for fallback in fallback_paths:
+            if fallback.exists():
+                logger.info(f"✅ Using fallback model: {fallback}")
+                return str(fallback)
+        raise FileNotFoundError("Model not found and MODEL_DOWNLOAD_URL not set")
+    
+    # Download model from external URL
+    logger.info(f"📥 Downloading model from {model_url}...")
+    try:
+        response = requests.get(model_url, stream=True, timeout=300)
+        response.raise_for_status()
+        
+        total_size = int(response.headers.get('content-length', 0))
+        downloaded = 0
+        
+        with open(save_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0 and downloaded % (1024 * 1024) == 0:  # Print every MB
+                        percent = (downloaded / total_size) * 100
+                        logger.info(f"  Downloaded: {downloaded / (1024*1024):.1f} MB ({percent:.1f}%)")
+        
+        logger.info(f"✅ Model downloaded successfully: {save_path.stat().st_size / (1024*1024):.2f} MB")
+        return str(save_path)
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to download model: {e}")
+        # Try fallback paths before raising error
+        base_dir = BASE_DIR.parent
+        fallback_paths = [
+            base_dir / "datasets" / "best 2.pt",
+            base_dir / "pest_detection_ml" / "models" / "best.pt",
+        ]
+        for fallback in fallback_paths:
+            if fallback.exists():
+                logger.warning(f"⚠️ Using fallback model: {fallback}")
+                return str(fallback)
+        raise
+
+
 # === Get Active Model Path (from database or fallback) ===
 def get_active_model_path() -> str:
     """Fetch the currently active model path from the database"""
@@ -191,15 +271,36 @@ def get_active_model_path() -> str:
     logger.error(f"❌ Model not found: {datasets_model}")
     return str(datasets_model)
 
-# Get model path (will use active model from database)
+# Get model path (will use active model from database or download if needed)
 # Note: This is called at module load time, but model is loaded lazily
 try:
+    # First try to get from database/fallback paths
     MODEL_PATH = get_active_model_path()
+    
+    # If model doesn't exist and we're on Heroku (or MODEL_DOWNLOAD_URL is set), download it
+    if not os.path.exists(MODEL_PATH) and os.getenv('MODEL_DOWNLOAD_URL'):
+        logger.info("🔄 Model not found locally, attempting to download...")
+        try:
+            MODEL_PATH = download_model_if_needed()
+        except Exception as e:
+            logger.error(f"❌ Failed to download model: {e}")
+            # Keep original path for error message
+            pass
 except Exception as e:
     logger.warning(f"Could not determine model path at startup: {e}")
-    # Fallback to default
-    BASE_DIR = Path(__file__).resolve().parent
-    MODEL_PATH = str(BASE_DIR.parent / "datasets" / "best 2.pt")
+    # Try to download if URL is available
+    if os.getenv('MODEL_DOWNLOAD_URL'):
+        try:
+            MODEL_PATH = download_model_if_needed()
+        except Exception as e2:
+            logger.error(f"❌ Failed to download model: {e2}")
+            # Fallback to default
+            BASE_DIR = Path(__file__).resolve().parent
+            MODEL_PATH = str(BASE_DIR.parent / "datasets" / "best 2.pt")
+    else:
+        # Fallback to default
+        BASE_DIR = Path(__file__).resolve().parent
+        MODEL_PATH = str(BASE_DIR.parent / "datasets" / "best 2.pt")
 
 # Pest information
 PEST_INFO = {
