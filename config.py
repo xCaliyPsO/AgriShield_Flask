@@ -87,6 +87,11 @@ def load_db_config_from_php():
 # Database configuration (from config.php)
 DB_CONFIG = load_db_config_from_php()
 
+# Log database configuration (without password for security)
+import logging
+logger = logging.getLogger(__name__)
+logger.info(f"📊 Database Config: host={DB_CONFIG.get('host')}, user={DB_CONFIG.get('user')}, database={DB_CONFIG.get('database')}")
+
 # Get PHP base URL for API calls (production-ready)
 def get_php_base_url():
     """Get PHP base URL for API calls"""

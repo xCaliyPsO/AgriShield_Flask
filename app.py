@@ -248,14 +248,14 @@ def get_active_model_path() -> str:
         logger.warning(f"⚠️ Could not get active model from database: {e}")
     
     # Fallback to default model - using "best 2.pt" from datasets folder
-    base_dir = BASE_DIR.parent  # Go up one level from AgriShield_ML_Flask to Proto1
-    datasets_model = base_dir / "datasets" / "best 2.pt"
+    # BASE_DIR is already at Proto1 root (where app.py is located)
+    datasets_model = BASE_DIR / "datasets" / "best 2.pt"
     if datasets_model.exists():
         logger.info(f"✅ Using default model: best 2.pt (from datasets folder)")
         return str(datasets_model)
     
     # Secondary fallback to models folder
-    fallback = base_dir / "pest_detection_ml" / "models" / "best.pt"
+    fallback = BASE_DIR / "pest_detection_ml" / "models" / "best.pt"
     if fallback.exists():
         logger.info(f"⚠️ Using fallback model: best.pt (from models folder)")
         return str(fallback)
@@ -266,6 +266,17 @@ def get_active_model_path() -> str:
         if full_path.exists():
             logger.info(f"✅ Using model from POSSIBLE_MODEL_PATHS: {full_path}")
             return str(full_path)
+    
+    # If neither exists, try other model files in datasets
+    other_models = [
+        BASE_DIR / "datasets" / "best.pt",
+        BASE_DIR / "datasets" / "best5.pt",
+        BASE_DIR / "yolov8n.pt",
+    ]
+    for model in other_models:
+        if model.exists():
+            logger.info(f"✅ Using alternative model: {model}")
+            return str(model)
     
     # If neither exists, return datasets path (will show error when loading)
     logger.error(f"❌ Model not found: {datasets_model}")
@@ -296,11 +307,11 @@ except Exception as e:
             logger.error(f"❌ Failed to download model: {e2}")
             # Fallback to default
             BASE_DIR = Path(__file__).resolve().parent
-            MODEL_PATH = str(BASE_DIR.parent / "datasets" / "best 2.pt")
+            MODEL_PATH = str(BASE_DIR / "datasets" / "best 2.pt")
     else:
         # Fallback to default
         BASE_DIR = Path(__file__).resolve().parent
-        MODEL_PATH = str(BASE_DIR.parent / "datasets" / "best 2.pt")
+        MODEL_PATH = str(BASE_DIR / "datasets" / "best 2.pt")
 
 # Pest information
 PEST_INFO = {
@@ -373,11 +384,31 @@ def load_yolo_model():
         return _model_cache
     
     # Use MODEL_PATH from get_active_model_path()
-    model_path = MODEL_PATH
+    model_path = Path(MODEL_PATH)
     
-    if not os.path.exists(model_path):
-        error_msg = f"Model weights not found at {model_path}. Ensure training completed and path is correct."
-        raise FileNotFoundError(error_msg)
+    # If model path doesn't exist, try to find it
+    if not model_path.exists():
+        logger.warning(f"⚠️ Model not found at {model_path}, trying alternative locations...")
+        # Try to find any .pt files in common locations
+        possible_locations = [
+            BASE_DIR / "datasets" / "best 2.pt",
+            BASE_DIR / "datasets" / "best.pt",
+            BASE_DIR / "datasets" / "best5.pt",
+            BASE_DIR / "pest_detection_ml" / "models" / "best.pt",
+            BASE_DIR / "yolov8n.pt",
+        ]
+        for loc in possible_locations:
+            if loc.exists():
+                logger.info(f"✅ Found model at alternative location: {loc}")
+                model_path = loc
+                break
+        else:
+            error_msg = f"Model weights not found at {MODEL_PATH}. Ensure training completed and path is correct."
+            logger.error(f"❌ Model file not found: {MODEL_PATH}")
+            logger.error(f"❌ Current working directory: {os.getcwd()}")
+            logger.error(f"❌ BASE_DIR: {BASE_DIR}")
+            logger.error(f"❌ Tried locations: {possible_locations}")
+            raise FileNotFoundError(error_msg)
     
     _loaded_model_path = str(model_path)
     _model_cache = YOLO(str(model_path))
@@ -588,6 +619,49 @@ def health_check():
         }), 500
 
 
+@app.route('/test_db', methods=['GET'])
+@app.route('/test_db/', methods=['GET'])
+def test_db():
+    """Test database connection and images_inbox table"""
+    try:
+        if not DB_AVAILABLE:
+            return jsonify({
+                "status": "error",
+                "message": "pymysql not available",
+                "db_available": False
+            }), 500
+        
+        connection = pymysql.connect(**DB_CONFIG)
+        cursor = connection.cursor(pymysql.cursors.DictCursor)
+        
+        # Test query
+        cursor.execute("SELECT COUNT(*) as count FROM images_inbox")
+        result = cursor.fetchone()
+        count = result['count'] if result else 0
+        
+        # Get last entry
+        cursor.execute("SELECT * FROM images_inbox ORDER BY id DESC LIMIT 1")
+        last_entry = cursor.fetchone()
+        
+        cursor.close()
+        connection.close()
+        
+        return jsonify({
+            "status": "success",
+            "db_available": True,
+            "db_config": {k: v if k != 'password' else '***' for k, v in DB_CONFIG.items()},
+            "total_entries": count,
+            "last_entry": last_entry
+        })
+    except Exception as e:
+        import traceback
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "db_available": DB_AVAILABLE
+        }), 500
+
 @app.route('/status', methods=['GET'])
 @app.route('/status/', methods=['GET'])
 def status_check():
@@ -737,8 +811,8 @@ def detect():
         }
         
         # Optional debug: return raw detections
+        dets = []  # Initialize dets to avoid NameError
         if request.args.get("debug") == "1" and results and results[0] and getattr(results[0], "boxes", None):
-            dets = []
             try:
                 boxes = results[0].boxes
                 for i in range(len(boxes)):
@@ -764,13 +838,18 @@ def detect():
             latitude = request.form.get('latitude') or request.args.get('latitude')
             longitude = request.form.get('longitude') or request.args.get('longitude')
             
-            if device_id and DB_AVAILABLE and total_pests > 0:
+            logger.info(f"🔍 Database save check: device_id={device_id}, DB_AVAILABLE={DB_AVAILABLE}, total_pests={total_pests}")
+            logger.info(f"🔍 Form data keys: {list(request.form.keys())}")
+            logger.info(f"🔍 Args data keys: {list(request.args.keys())}")
+            
+            # Save to database if device_id is provided (even if no pests detected for testing)
+            if device_id and DB_AVAILABLE:
                 # Save image file
                 import uuid
                 from datetime import datetime
                 
                 # Create uploads directory if it doesn't exist
-                uploads_dir = BASE_DIR.parent / "uploads"
+                uploads_dir = BASE_DIR / "uploads"
                 uploads_dir.mkdir(parents=True, exist_ok=True)
                 
                 # Generate unique filename
@@ -786,8 +865,36 @@ def detect():
                     f.write(image_bytes)
                 
                 # Save to database
+                logger.info(f"📊 Connecting to database: {DB_CONFIG.get('host')} / {DB_CONFIG.get('database')}")
                 connection = pymysql.connect(**DB_CONFIG)
                 cursor = connection.cursor()
+                
+                # Check if images_inbox table has GPS columns, if not, add them
+                try:
+                    cursor.execute("SHOW COLUMNS FROM images_inbox LIKE 'gps_latitude'")
+                    if not cursor.fetchone():
+                        # Add GPS columns if they don't exist
+                        logger.info("⚠️ GPS columns not found, adding them to images_inbox table...")
+                        try:
+                            cursor.execute("ALTER TABLE images_inbox ADD COLUMN gps_latitude DECIMAL(10,8) DEFAULT NULL")
+                        except Exception:
+                            pass  # Column might already exist
+                        try:
+                            cursor.execute("ALTER TABLE images_inbox ADD COLUMN gps_longitude DECIMAL(11,8) DEFAULT NULL")
+                        except Exception:
+                            pass
+                        try:
+                            cursor.execute("ALTER TABLE images_inbox ADD COLUMN gps_accuracy DECIMAL(10,2) DEFAULT NULL")
+                        except Exception:
+                            pass
+                        try:
+                            cursor.execute("ALTER TABLE images_inbox ADD COLUMN location_timestamp VARCHAR(50) DEFAULT NULL")
+                        except Exception:
+                            pass
+                        connection.commit()
+                        logger.info("✅ Added GPS columns to images_inbox table")
+                except Exception as e:
+                    logger.warning(f"⚠️ Could not check/alter table: {e}")
                 
                 # Prepare classification data as JSON (matches classification_json column)
                 classification_json = json.dumps({
@@ -807,57 +914,97 @@ def detect():
                 gps_accuracy = request.form.get('gps_accuracy') or request.args.get('gps_accuracy')
                 location_timestamp = request.form.get('location_timestamp') or request.args.get('location_timestamp')
                 
-                # Insert into inbox_image table (matching exact table structure)
-                insert_query = """
-                    INSERT INTO inbox_image 
-                    (device_id, parcel_ref, image_path, image_size, created_at, classification_json, 
-                     gps_latitude, gps_longitude, gps_accuracy, location_timestamp)
-                    VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s)
-                """
-                
                 image_path_relative = f"uploads/{filename}"
                 
-                cursor.execute(insert_query, (
-                    device_id,
-                    parcel_ref if parcel_ref else None,
-                    image_path_relative,
-                    image_size,
-                    classification_json,
-                    float(latitude) if latitude else None,
-                    float(longitude) if longitude else None,
-                    float(gps_accuracy) if gps_accuracy else None,
-                    location_timestamp if location_timestamp else None
-                ))
+                # Insert into images_inbox table (matching exact table structure)
+                # Check which columns exist in the table
+                cursor.execute("SHOW COLUMNS FROM images_inbox")
+                columns = {row[0]: row for row in cursor.fetchall()}
+                has_gps = 'gps_latitude' in columns
+                
+                # Handle parcel_ref - use 0 as default if not provided (since it's INT NOT NULL)
+                if parcel_ref and parcel_ref.isdigit():
+                    parcel_ref_value = int(parcel_ref)
+                else:
+                    parcel_ref_value = 0  # Default to 0 for NOT NULL INT column
+                
+                if has_gps:
+                    # Full INSERT with GPS columns
+                    insert_query = """
+                        INSERT INTO images_inbox 
+                        (device_id, parcel_ref, image_path, image_size, created_at, classification_json, 
+                         gps_latitude, gps_longitude, gps_accuracy, location_timestamp)
+                        VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s)
+                    """
+                    cursor.execute(insert_query, (
+                        device_id,
+                        parcel_ref_value,
+                        image_path_relative,
+                        image_size,
+                        classification_json,
+                        float(latitude) if latitude else None,
+                        float(longitude) if longitude else None,
+                        float(gps_accuracy) if gps_accuracy else None,
+                        location_timestamp if location_timestamp else None
+                    ))
+                else:
+                    # INSERT without GPS columns (older table structure)
+                    insert_query = """
+                        INSERT INTO images_inbox 
+                        (device_id, parcel_ref, image_path, image_size, created_at, classification_json)
+                        VALUES (%s, %s, %s, %s, NOW(), %s)
+                    """
+                    cursor.execute(insert_query, (
+                        device_id,
+                        parcel_ref_value,
+                        image_path_relative,
+                        image_size,
+                        classification_json
+                    ))
                 
                 connection.commit()
                 cursor.close()
                 connection.close()
                 
+                inserted_id = cursor.lastrowid
                 logger.info(f"✅ Saved detection to database: device_id={device_id}, pests={total_pests}, file={filename}")
+                logger.info(f"✅ Database insert successful - ID={inserted_id} in images_inbox table")
                 response_payload["saved_to_db"] = True
+                response_payload["db_insert_id"] = inserted_id
                 response_payload["image_path"] = image_path_relative
+                response_payload["db_message"] = f"Saved to images_inbox table with device_id={device_id}, ID={inserted_id}"
             else:
                 if not device_id:
-                    logger.debug("No device_id provided, skipping database save")
+                    logger.warning("⚠️ No device_id provided, skipping database save")
+                    response_payload["db_save_skipped"] = "No device_id"
                 elif not DB_AVAILABLE:
-                    logger.warning("Database not available, skipping save")
-                elif total_pests == 0:
-                    logger.debug("No pests detected, skipping database save")
+                    logger.warning("⚠️ Database not available, skipping save")
+                    response_payload["db_save_skipped"] = "Database not available"
+                else:
+                    logger.warning("⚠️ Unknown reason for skipping database save")
+                    response_payload["db_save_skipped"] = "Unknown reason"
         except Exception as e:
-            logger.error(f"Error saving to database: {e}")
+            logger.error(f"❌ Error saving to database: {e}")
             import traceback
-            traceback.print_exc()
+            logger.error(f"❌ Traceback: {traceback.format_exc()}")
             # Don't fail the request if database save fails
             response_payload["db_save_error"] = str(e)
+            response_payload["db_save_failed"] = True
         
         return jsonify(response_payload)
         
     except FileNotFoundError as e:
         logger.error(f"Model not found: {e}")
+        logger.error(f"Model path attempted: {MODEL_PATH}")
         return jsonify({
             "status": "error",
             "error": f"ML model not found: {e}",
-            "message": "Please ensure model file exists at ml_models/pest_detection/best.pt"
+            "message": f"Please ensure model file exists at {MODEL_PATH}",
+            "model_path": str(MODEL_PATH),
+            "suggested_paths": [
+                "datasets/best 2.pt",
+                "pest_detection_ml/models/best.pt"
+            ]
         }), 500
     except Exception as e:
         logger.error(f"Detection error: {e}")
@@ -1125,7 +1272,12 @@ class SimplePestForecaster:
                     # Parse timestamp
                     timestamp_str = hour_data.get('timestamp', '')
                     if isinstance(timestamp_str, str):
-                        timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                        # Handle both formats: with seconds and without
+                        try:
+                            timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                        except ValueError:
+                            # Try format without seconds
+                            timestamp = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M')
                     else:
                         timestamp = timestamp_str
                     
@@ -1322,7 +1474,12 @@ class SimplePestForecaster:
             timestamp_str = hour_data.get('timestamp', '')
             try:
                 if isinstance(timestamp_str, str):
-                    hour_dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                    # Handle both formats: with seconds and without
+                    try:
+                        hour_dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S')
+                    except ValueError:
+                        # Try format without seconds
+                        hour_dt = datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M')
                 else:
                     hour_dt = timestamp_str
                 date_key = hour_dt.strftime('%Y-%m-%d')
