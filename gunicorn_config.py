@@ -1,9 +1,9 @@
 # Gunicorn configuration file for production deployment
 
 # Server socket
-# Production: bind to 127.0.0.1 (localhost only - PHP calls it)
-# For external access, use 0.0.0.0:5001 (not recommended without firewall)
-bind = "127.0.0.1:5001"  # Only accessible from localhost (PHP will call it)
+# Production: bind to 0.0.0.0 to accept external connections (Android app needs this)
+# For localhost-only access, use 127.0.0.1:5001
+bind = "0.0.0.0:5001"  # Accept connections from any IP (required for Android app)
 backlog = 2048
 
 # Worker processes
