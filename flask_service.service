@@ -1,0 +1,24 @@
+[Unit]
+Description=AgriShield ML Pest Detection API (Gunicorn)
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/path/to/Proto1/AgriShield_ML_Flask
+Environment="PATH=/usr/bin:/usr/local/bin"
+Environment="PORT=5001"
+ExecStart=/usr/local/bin/gunicorn -c gunicorn_config.py wsgi:application
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/agrishield-ml-api.log
+StandardError=append:/var/log/agrishield-ml-api-error.log
+
+[Install]
+WantedBy=multi-user.target
+
+
+
+
